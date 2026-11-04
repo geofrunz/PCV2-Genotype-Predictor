@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# PCV2 genotype predictor - Linux launcher
+set -Eeuo pipefail
+
+resolve_script_dir() {
+    local source_path="${BASH_SOURCE[0]}"
+    while [[ -L "$source_path" ]]; do
+        local source_dir
+        source_dir="$(cd -P -- "$(dirname -- "$source_path")" >/dev/null 2>&1 && pwd)"
+        source_path="$(readlink -- "$source_path")"
+        [[ "$source_path" != /* ]] && source_path="$source_dir/$source_path"
+    done
+    cd -P -- "$(dirname -- "$source_path")" >/dev/null 2>&1 && pwd
+}
+
+APP_DIR="$(resolve_script_dir)"
+PROGRAM="$APP_DIR/pcv2_predict.py"
+REQUIREMENTS="$APP_DIR/requirements.txt"
+MODEL="$APP_DIR/final_random_forest_full_dataset.joblib"
+VENV_DIR="${PCV2_VENV:-$APP_DIR/.pcv2_env}"
+VENV_PYTHON="$VENV_DIR/bin/python"
+SETUP_ONLY=0
+
+if [[ "${1:-}" == "--setup-only" ]]; then
+    SETUP_ONLY=1
+    shift
+fi
+
+fail() {
+    printf '\nERRORE: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ -f "$PROGRAM" ]] || fail "programma principale non trovato: $PROGRAM"
+[[ -f "$REQUIREMENTS" ]] || fail "requirements.txt non trovato: $REQUIREMENTS"
+[[ -f "$MODEL" ]] || fail "modello non trovato: $MODEL"
+
+python_is_supported() {
+    local candidate="$1"
+    [[ -x "$candidate" ]] || return 1
+    "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+find_base_python() {
+    local candidate resolved
+
+    if [[ -n "${PCV2_PYTHON:-}" ]]; then
+        candidate="$PCV2_PYTHON"
+        if python_is_supported "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        fail "PCV2_PYTHON non indica un Python >= 3.10 eseguibile: $candidate"
+    fi
+
+    for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+        if resolved="$(command -v "$candidate" 2>/dev/null)" && python_is_supported "$resolved"; then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    done
+
+    for candidate in \
+        "$HOME/anaconda3/bin/python" \
+        "$HOME/miniconda3/bin/python" \
+        "$HOME/mambaforge/bin/python" \
+        "$HOME/miniforge3/bin/python" \
+        "/opt/conda/bin/python"; do
+        if python_is_supported "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+print_python_install_help() {
+    local distro_id=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        distro_id="${ID:-}"
+    fi
+
+    printf '\nPython 3.10 o successivo non è stato trovato.\n' >&2
+    case "$distro_id" in
+        ubuntu|debian|linuxmint|pop)
+            printf 'Installazione consigliata:\n  sudo apt update && sudo apt install python3 python3-venv python3-pip\n' >&2
+            ;;
+        fedora|rhel|centos|rocky|almalinux)
+            printf 'Installazione consigliata:\n  sudo dnf install python3 python3-pip\n' >&2
+            ;;
+        arch|manjaro)
+            printf 'Installazione consigliata:\n  sudo pacman -S python python-pip\n' >&2
+            ;;
+        opensuse*|sles)
+            printf 'Installazione consigliata:\n  sudo zypper install python3 python3-pip python3-virtualenv\n' >&2
+            ;;
+        *)
+            printf 'Installare Python 3, pip e il modulo venv con il gestore pacchetti della distribuzione.\n' >&2
+            ;;
+    esac
+}
+
+create_environment() {
+    local base_python="$1"
+    printf 'Prima esecuzione: creo un ambiente Python isolato...\n'
+    printf 'Python rilevato: %s\n' "$base_python"
+
+    if ! "$base_python" -m venv "$VENV_DIR"; then
+        rm -rf -- "$VENV_DIR"
+        printf '\nNon è stato possibile creare il virtual environment.\n' >&2
+        printf 'Su Ubuntu/Debian installare il modulo venv con:\n  sudo apt install python3-venv\n' >&2
+        fail "creazione dell'ambiente Python non riuscita"
+    fi
+}
+
+dependencies_are_ready() {
+    [[ -x "$VENV_PYTHON" ]] || return 1
+    "$VENV_PYTHON" - <<'PY' >/dev/null 2>&1
+import joblib
+import numpy
+import pandas
+import sklearn
+import imblearn
+raise SystemExit(0 if sklearn.__version__ == "1.9.0" else 1)
+PY
+}
+
+install_dependencies() {
+    printf 'Installazione/aggiornamento delle librerie necessarie...\n'
+    printf 'Questa operazione richiede Internet soltanto durante la configurazione.\n'
+    if ! "$VENV_PYTHON" -m pip install --disable-pip-version-check -r "$REQUIREMENTS"; then
+        printf '\nL’installazione delle librerie non è riuscita.\n' >&2
+        printf 'Verificare la connessione Internet e riprovare.\n' >&2
+        printf 'Comando diagnostico:\n  "%s" -m pip install -r "%s"\n' "$VENV_PYTHON" "$REQUIREMENTS" >&2
+        exit 1
+    fi
+}
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    BASE_PYTHON="$(find_base_python || true)"
+    if [[ -z "$BASE_PYTHON" ]]; then
+        print_python_install_help
+        exit 1
+    fi
+    create_environment "$BASE_PYTHON"
+fi
+
+if ! dependencies_are_ready; then
+    install_dependencies
+fi
+
+if [[ "$SETUP_ONLY" -eq 1 ]]; then
+    printf '\nConfigurazione completata.\n'
+    printf 'Ambiente: %s\n' "$VENV_DIR"
+    exit 0
+fi
+
+exec "$VENV_PYTHON" "$PROGRAM" --no-install "$@"
